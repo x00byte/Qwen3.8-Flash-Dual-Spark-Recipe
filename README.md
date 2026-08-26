@@ -145,21 +145,121 @@ holds the vLLM flags.
 | `MAX_NUM_SEQS` | `8` | concurrent sequences |
 | `GPU_MEMORY_UTILIZATION` | `0.85` | vLLM gpu-memory-utilization |
 
-## Why the patch
+## Exact `vllm serve` command
 
-The checkpoint is hybrid: routed experts are ModelOpt **NVFP4**, but the PLE n-gram embedding
-table ships as **FP8** shards with a single global `ngram_embedding.weight_scale`. vLLM's
-`_get_ple_embedding_quant_method()` only enables the FP8 PLE path under an `Fp8Config`, so for
-this checkpoint it returns `None` and the PLE is silently served wrong (FP8 bytes upcast to bf16
-with no scale applied). Fixing that gate exposes a second bug — `weight_scale` registered as both
-parameter and buffer. `ple_layer.py` in this repo fixes both.
+This is the full command the published image runs (see `serve.sh`). It's shown with the model
+mounted at `/model` — swap in your own path if you mount it elsewhere.
 
-## Why `--enforce-eager`
+**Head node (rank 0) — API server + engine core:**
 
-On GB10, enabling CUDA graphs / `torch.compile` (i.e. dropping `--enforce-eager`, or adding
-`--optimization-level 1`) makes vLLM enter an inductor compile of the backbone after weight load
-that can hang the whole box for tens of minutes and then exit 255. Eager mode is the stable path
-here — the benchmark above was produced in eager mode.
+```bash
+vllm serve /model \
+  --served-model-name qwen38-flash-next-nvfp4 \
+  --quantization modelopt_fp4 \
+  --tensor-parallel-size 2 \
+  --pipeline-parallel-size 1 \
+  --nnodes 2 \
+  --master-addr "$MASTER_ADDR" \
+  --master-port 29501 \
+  --node-rank 0 \
+  --distributed-executor-backend mp \
+  --enforce-eager \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":4}' \
+  --max-model-len 262144 \
+  --max-num-seqs 8 \
+  --max-num-batched-tokens 8192 \
+  --enable-chunked-prefill \
+  --enable-prefix-caching \
+  --gpu-memory-utilization 0.85 \
+  --tool-call-parser qwen3_coder \
+  --enable-auto-tool-choice \
+  --reasoning-parser qwen3 \
+  --host 0.0.0.0 \
+  --port 8888
+```
+
+**Worker node (rank 1) — workers only, no API server:**
+
+```bash
+vllm serve /model \
+  --served-model-name qwen38-flash-next-nvfp4 \
+  --quantization modelopt_fp4 \
+  --tensor-parallel-size 2 \
+  --pipeline-parallel-size 1 \
+  --nnodes 2 \
+  --master-addr "$MASTER_ADDR" \
+  --master-port 29501 \
+  --node-rank 1 \
+  --distributed-executor-backend mp \
+  --enforce-eager \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":4}' \
+  --max-model-len 262144 \
+  --max-num-seqs 8 \
+  --max-num-batched-tokens 8192 \
+  --enable-chunked-prefill \
+  --enable-prefix-caching \
+  --gpu-memory-utilization 0.85 \
+  --tool-call-parser qwen3_coder \
+  --enable-auto-tool-choice \
+  --reasoning-parser qwen3 \
+  --host 0.0.0.0 \
+  --port 8888 \
+  --headless
+```
+
+## Problems we hit — and how we fixed them
+
+### 1. Dropping `--enforce-eager` locked up the whole node
+
+We tried removing `--enforce-eager` (and/or adding `--optimization-level 1`) to see whether CUDA
+graphs would help. Instead, after weights finished loading, vLLM entered a `torch.compile` /
+inductor compile of the backbone, logged `No available shared memory broadcast block found in 60
+seconds` every minute for ~20 minutes, then exited with code 255 — and took the DGX Spark down
+with it (the unified-memory box became unresponsive).
+
+**Fix:** keep `--enforce-eager`. On GB10, CUDA graphs and torch.compile aren't worth the risk;
+eager is the stable path. The 91/100 benchmark in this README was produced in eager mode.
+
+### 2. PLE n-gram embedding was silently served wrong
+
+The checkpoint is hybrid: routed experts are ModelOpt **NVFP4**, but the PLE n-gram table ships as
+**FP8** shards with a single global `ngram_embedding.weight_scale`. vLLM only enabled its FP8 PLE
+path when the outer quant config was an `Fp8Config`; here it's `modelopt`, so it silently upcast
+the FP8 bytes to bf16 with no scale applied — no crash, just wrong embeddings.
+
+**Fix:** patch `_get_ple_embedding_quant_method()` to use the FP8 path whenever
+`ple_embedding_dtype == "float8_e4m3fn"`, regardless of the outer quant config.
+
+### 3. `KeyError: attribute 'weight_scale' already exists`
+
+The moment the gate above was fixed, a second bug surfaced: the FP8 PLE method registered
+`weight_scale` as a parameter in `create_weights`, while the loader registered it as a buffer.
+
+**Fix:** stop registering it as a parameter — the buffer (read by `_dequantize_embeddings`) is the
+one that survives. Both fixes live in `ple_layer.py`.
+
+### 4. Follower node crashed at KV-cache init
+
+Without `--headless` on the worker, the follower node hit
+`AssertionError: collective_rpc should not be called on follower node` during KV-cache init.
+
+**Fix:** run the rank-1 container with `--headless`. The head runs the API server + engine core;
+the worker is workers only.
+
+### 5. Warm page cache starved the GPU allocator mid-load
+
+On GB10's unified memory, a warm page cache from a previous load could starve the GPU allocator
+halfway through the 126 GiB checkpoint load.
+
+**Fix:** drop page cache before loading (`echo 3 > /proc/sys/vm/drop_caches`). `run.sh` does this
+from a `--privileged` one-shot container on both nodes.
+
+### 6. `tool_choice:"auto"` returned HTTP 400
+
+Tool-calling requests with `tool_choice:"auto"` failed with 400 until we enabled auto tool choice
+on the server.
+
+**Fix:** add `--enable-auto-tool-choice` alongside `--tool-call-parser qwen3_coder`.
 
 ## Rebuilding the image
 
