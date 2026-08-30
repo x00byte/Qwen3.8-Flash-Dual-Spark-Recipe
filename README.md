@@ -16,7 +16,7 @@ No Ray — just vLLM's `mp` distributed executor, one container per node.
 This repository is a turn-key, production-style deployment recipe for running the
 **Qwen3.8 Flash Next NVFP4** checkpoint on a pair of NVIDIA DGX Spark boxes. It ships a
 patched, self-contained vLLM image and a one-command launcher that handles model download,
-node-to-node sync, and dual-node bring-up.
+node-to-node sync, and dual-node bring-up. Sharing this as the SGlang ones have not worked consistently for my agentic work, VLLM has proven much faster and more stable!
 
 | | |
 |---|---|
@@ -64,6 +64,58 @@ curl http://127.0.0.1:8888/v1/models
 ```
 
 ## Benchmarks
+
+   # Qwen3.8-Flash-Next-NVFP4 — vLLM Benchmark (2× DGX Spark, TP2)
+
+   **Config:** vLLM `local/vllm-qwen38:ple-fp8-fix` · MTP3 speculative (0.72 acceptance) · fp8 KV · `--enforce-eager` · `--gpu-memory-utilization 0.80` · 262,144
+ context · thinking off · warmed, on-box
+
+   ## Single-Stream Decode (temp 0, 512-token gens, median of 3)
+
+   | Content type | tok/s |
+   |---|---:|
+   | Counting / structured | 63.7 |
+   | Code | 53.6 |
+   | Mixed (reasoning + code) | 47.4 |
+   | Freeform prose | 39.3 |
+
+   ## Prefill / TTFT (cold, unique prompts, 1 output token)
+
+   | Prompt length | TTFT | Prefill throughput |
+   |---|---:|---:|
+   | 1K | 0.71 s | 1,452 tok/s |
+   | 32K | 11.2 s | 2,932 tok/s |
+   | 128K | 49.5 s | 2,652 tok/s |
+
+   ## Concurrency (code prompts, 400-token generations)
+
+   | Streams | Aggregate tok/s | Per-stream tok/s |
+   |---|---:|---:|
+   | ×1 | 47.4 | 48.3 |
+   | ×2 | 86.0 | 47.9 |
+   | ×4 | 118.4 | 39.7 |
+   | ×8 | 196.3 | 32.5 |
+
+   ## Agentic Long-Context — 4 × 128K Concurrent
+
+   | Metric | Value |
+   |---|---:|
+   | Wall time (4 × 128,032-token prompts, 512-tok gens) | 68.9 s |
+   | Prefill aggregate | 7,433 tok/s |
+   | TTFT | ~50–54 s |
+   | Per-stream decode (post-prefill) | 25–36 tok/s |
+
+   ## Resources & Stability
+
+   | Metric | Value |
+   |---|---:|
+   | KV cache pool | 1,905,857 tokens (7.27× 262K) |
+   | Memory headroom (idle) | ~9 GB |
+   | 16-way quality stress | 48/48 clean, 0 NaN |
+   | MTP acceptance | 0.72 |
+
+
+
 
 Full tool-calling evaluation with
 [tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench) — the standard **69-scenario**
